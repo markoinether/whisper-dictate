@@ -65,6 +65,32 @@ To start automatically on login, copy `WhisperDictation.vbs` to your startup fol
 
 ---
 
+## Standalone executable (no Python required)
+
+A pre-built Windows executable can be produced with PyInstaller. The resulting folder runs on any Windows 10/11 machine without Python or pip installed.
+
+### Build
+
+```bat
+pip install pyinstaller
+pyinstaller -y whisper_dictation.spec
+```
+
+Output: `dist\WhisperDictation\WhisperDictation.exe` (~260 MB folder)
+
+### Distribute
+
+Zip the entire `dist\WhisperDictation\` folder and copy it to the target machine. Run `WhisperDictation.exe` directly — no installer needed.
+
+### Notes
+
+- The Whisper model (~460 MB) is **not** bundled. It downloads automatically on first run and caches in `%USERPROFILE%\.cache\huggingface\hub\`.
+- CUDA DLLs are **not** bundled (would add ~1.2 GB). GPU acceleration works if the target machine has CUDA Toolkit 12.x installed system-wide. Without it the app falls back to CPU silently.
+- The log file (`whisper_dictate.log`) is written next to `WhisperDictation.exe`.
+- To add to Windows startup, place a shortcut to `WhisperDictation.exe` in `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\`.
+
+---
+
 ## Usage
 
 1. Press `Ctrl+Alt+R` — the tray icon turns red and you hear a high beep
@@ -125,19 +151,20 @@ Text is copied to the clipboard with `pyperclip`, then `keybd_event` sends `Ctrl
 
 ```
 whisper-dictate/
-├── whisper_dictate.py          Main script
-├── requirements.txt            Core dependencies
-├── requirements-windows-gpu.txt  NVIDIA GPU libraries (Windows)
+├── whisper_dictate.py              Main script
+├── whisper_dictation.spec          PyInstaller build spec
+├── requirements.txt                Core dependencies
+├── requirements-windows-gpu.txt    NVIDIA GPU libraries (Windows)
 ├── launchers/
 │   ├── windows/
-│   │   ├── WhisperDictation.vbs   Silent launcher (startup-ready)
-│   │   ├── start_dictation.bat    Console launcher (debugging)
-│   │   └── install.bat            One-step installer
+│   │   ├── WhisperDictation.vbs    Silent launcher (startup-ready)
+│   │   ├── start_dictation.bat     Console launcher (debugging)
+│   │   └── install.bat             One-step installer
 │   ├── linux/
-│   │   └── README.md              Implementation notes
+│   │   └── README.md               Implementation notes
 │   └── macos/
-│       └── README.md              Implementation notes
-├── CLAUDE.md                   Developer notes and gotchas
+│       └── README.md               Implementation notes
+├── CLAUDE.md                       Developer notes and gotchas
 ├── LICENSE
 └── .gitignore
 ```

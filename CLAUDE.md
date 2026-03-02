@@ -13,11 +13,13 @@ and pastes the result into whatever window is in focus.
 ## File layout
 ```
 whisper-dictate/
-  whisper_dictate.py     ← main script
-  WhisperDictation.vbs   ← silent launcher (use this for startup / normal use)
-  start_dictation.bat    ← visible console launcher (use for debugging)
-  whisper_dictate.log    ← runtime log (created on launch, overwritten each run)
-  CLAUDE.md              ← this file
+  whisper_dictate.py        ← main script
+  whisper_dictation.spec    ← PyInstaller build spec
+  WhisperDictation.vbs      ← silent launcher (use this for startup / normal use)
+  start_dictation.bat       ← visible console launcher (use for debugging)
+  whisper_dictate.log       ← runtime log (created on launch, overwritten each run)
+  CLAUDE.md                 ← this file
+  dist/WhisperDictation/    ← built exe output (gitignored)
 ```
 
 **Startup folder entry:**
@@ -145,6 +147,31 @@ ALLOWED_LANGS = {"en", "sk"}
 INITIAL_PROMPT = "Toto je prepis. This is a transcription."
 ```
 To upgrade accuracy (at the cost of speed): change `MODEL_SIZE` to `"medium"`.
+
+---
+
+## PyInstaller exe build
+
+Build command (run from repo root, requires `pip install pyinstaller`):
+```bat
+pyinstaller -y whisper_dictation.spec
+```
+Output: `dist\WhisperDictation\WhisperDictation.exe` (~260 MB onedir bundle)
+
+**What the spec does:**
+- `collect_all()` for `faster_whisper`, `ctranslate2`, `tokenizers`, `huggingface_hub`, `av`
+- `console=False` — no window (equivalent to pythonw)
+- Excludes `nvidia` CUDA packages (~1.2 GB), `torch`, `tensorflow`
+- UPX compression enabled
+
+**Frozen-exe specifics in whisper_dictate.py:**
+- `_SCRIPT_DIR` uses `sys.executable` (not `__file__`) when `sys.frozen` is True — `__file__` resolves to a temp extraction path inside the exe, not the exe's actual directory
+- `kill_existing_instances()` branches on `sys.frozen`: frozen → match other processes by `proc.info["exe"]` path; script → match by cmdline as before
+- Log file lands next to `WhisperDictation.exe` in the dist folder
+
+**Whisper model not bundled** — downloads on first run to `%USERPROFILE%\.cache\huggingface\hub\` (~460 MB). Subsequent runs load from cache instantly.
+
+**CUDA in the exe** — nvidia-* pip DLLs are excluded from the bundle. GPU works if CUDA Toolkit 12.x is installed system-wide on the target PC. Without it, falls back to CPU.
 
 ---
 
