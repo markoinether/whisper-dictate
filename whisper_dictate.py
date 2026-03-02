@@ -20,34 +20,51 @@ import ctypes.wintypes
 import winsound
 import psutil
 
-# When launched via pythonw.exe (no console), redirect output to a log file
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Resolve the directory that contains this script (or exe when frozen by PyInstaller)
+if getattr(sys, "frozen", False):
+    _SCRIPT_DIR = os.path.dirname(sys.executable)
+else:
+    _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def kill_existing_instances():
-    current_pid  = os.getpid()
-    script_full  = os.path.normcase(os.path.abspath(__file__))
-    # When launched via `python whisper_dictate.py` (bat file), the cmdline stores
-    # only the bare filename — not the full path — so we must match on both.
-    script_name  = os.path.basename(script_full)   # "whisper_dictate.py"
+    current_pid = os.getpid()
+    to_kill     = []
 
-    def _is_our_script(cmdline):
-        for arg in cmdline:
-            n = os.path.normcase(arg)
-            if script_full in n or n.endswith(script_name):
-                return True
-        return False
-
-    to_kill = []
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            if proc.pid == current_pid:
-                continue
-            if proc.info["name"] in ("python.exe", "pythonw.exe"):
-                if _is_our_script(proc.info["cmdline"] or []):
+    if getattr(sys, "frozen", False):
+        # Running as a PyInstaller exe — match by exe path
+        our_exe = os.path.normcase(sys.executable)
+        for proc in psutil.process_iter(["pid", "exe"]):
+            try:
+                if proc.pid == current_pid:
+                    continue
+                if os.path.normcase(proc.info["exe"] or "") == our_exe:
                     to_kill.append(proc)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    else:
+        # Running as a Python script — match by script name in cmdline.
+        # When launched via bat as `python whisper_dictate.py`, the cmdline
+        # stores only the bare filename, so match on both full path and basename.
+        script_full = os.path.normcase(os.path.abspath(__file__))
+        script_name = os.path.basename(script_full)   # "whisper_dictate.py"
+
+        def _is_our_script(cmdline):
+            for arg in cmdline:
+                n = os.path.normcase(arg)
+                if script_full in n or n.endswith(script_name):
+                    return True
+            return False
+
+        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                if proc.pid == current_pid:
+                    continue
+                if proc.info["name"] in ("python.exe", "pythonw.exe"):
+                    if _is_our_script(proc.info["cmdline"] or []):
+                        to_kill.append(proc)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
 
     for proc in to_kill:
         try:
