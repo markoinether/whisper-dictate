@@ -1,0 +1,41 @@
+# Runtime files
+whisper_dictate.log
+*.log
+
+# Temporary audio
+*.wav
+*.mp3
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Model cache (large, downloaded on first run)
+.cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets / local config
+.env
+*.local
