@@ -115,15 +115,19 @@ INITIAL_PROMPT = "Toto je prepis. This is a transcription."
 
 ### Model sizes
 
-| Model | VRAM | Speed (GPU) | Accuracy |
-|-------|------|-------------|----------|
-| tiny | ~200 MB | Very fast | Low |
-| base | ~300 MB | Fast | Fair |
-| small | ~500 MB | Fast | Good |
+The app uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper)'s CTranslate2-converted versions of OpenAI's Whisper models, downloaded automatically from Hugging Face on first run and cached in `%USERPROFILE%\.cache\huggingface\hub\`.
+
+**Default:** `small` (OpenAI Whisper small, CTranslate2 int8 quantization)
+
+| Model | Cache size | Speed (GPU) | Accuracy |
+|-------|-----------|-------------|----------|
+| tiny | ~75 MB | Very fast | Low |
+| base | ~145 MB | Fast | Fair |
+| small | ~460 MB | Fast | Good |
 | medium | ~1.5 GB | Moderate | Better |
 | large-v2 | ~3 GB | Slow | Best |
 
-`small` is the default and fits on most laptop GPUs.
+`small` is the default and fits on most laptop GPUs. These are static model weights — they do not update automatically and do not expire.
 
 ---
 
