@@ -12,9 +12,10 @@ Model:     small
 
 import os
 import sys
+import site
 import time
 import threading
-import tempfile
+import traceback
 import ctypes
 import ctypes.wintypes
 import winsound
@@ -87,34 +88,55 @@ if sys.stdout is None or not hasattr(sys.stdout, "isatty") or not sys.stdout.isa
 
 import pyperclip
 import sounddevice as sd
-import soundfile as sf
 import numpy as np
 import pystray
-import site
 from PIL import Image, ImageDraw
 
 # Add CUDA DLL directories so ctranslate2 can find cublas/cudnn.
 # Covers both pip-installed nvidia-* packages and system CUDA Toolkit.
+#
+# IMPORTANT: In a PyInstaller frozen exe, site.getsitepackages() returns paths
+# relative to the exe (not the real Python install), so we also scan common
+# Windows Python user-install locations explicitly.
 def _add_cuda_dll_dirs():
     import glob
-    candidates = []
+    search_roots = []
+
+    # Works in script mode; returns wrong paths when frozen.
+    try:
+        search_roots.extend(site.getsitepackages())
+    except Exception:
+        pass
+
+    # Frozen exe: scan the actual user Python install under LOCALAPPDATA.
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    if localappdata:
+        for py_dir in glob.glob(
+            os.path.join(localappdata, "Programs", "Python", "Python3*")
+        ):
+            search_roots.append(os.path.join(py_dir, "Lib", "site-packages"))
+
     # pip-installed nvidia-* packages (nvidia-cublas-cu12, nvidia-cudnn-cu12, etc.)
-    for sp in site.getsitepackages():
+    for sp in search_roots:
         for pkg in ("cublas", "cudnn", "cuda_runtime", "cufft", "curand"):
             p = os.path.join(sp, "nvidia", pkg, "bin")
             if os.path.exists(p):
-                candidates.append(p)
+                try:
+                    os.add_dll_directory(p)
+                except OSError:
+                    pass
+
     # System CUDA Toolkit
     for pattern in [
         r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12*\bin",
         r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11*\bin",
     ]:
-        candidates.extend(sorted(glob.glob(pattern)))
-    for d in candidates:
-        try:
-            os.add_dll_directory(d)
-        except OSError:
-            pass
+        for d in sorted(glob.glob(pattern)):
+            try:
+                os.add_dll_directory(d)
+            except OSError:
+                pass
+
 
 _add_cuda_dll_dirs()
 
@@ -131,8 +153,20 @@ CHANNELS      = 1
 POLL_INTERVAL = 0.05
 DEBOUNCE_S    = 0.4
 
-INITIAL_PROMPT  = "Toto je prepis. This is a transcription."
-ALLOWED_LANGS   = {"en", "sk"}
+INITIAL_PROMPT = "Toto je prepis. This is a transcription."
+ALLOWED_LANGS  = {"en", "sk"}
+
+# Whisper commonly hallucinates these phrases on silence or very short audio.
+# Any transcription that matches one of these exactly (case-insensitive) is discarded.
+HALLUCINATIONS = {
+    ".", "..", "...",
+    "thank you.", "thanks for watching.", "thank you for watching.",
+    "thanks for watching", "thank you for watching",
+    "please subscribe.", "like and subscribe.",
+    "subtitles by", "subtitles by the amara.org community",
+    "you", "you.", "bye.", "bye-bye.",
+    "this video is brought to you by",
+}
 
 VK_CONTROL = 0x11
 VK_ALT     = 0x12
@@ -140,18 +174,22 @@ VK_R       = 0x52
 
 # ──────────────────────────────────────────────────────────────────────────────
 
-recording    = False
-audio_frames = []
-_lock        = threading.Lock()
-model        = None
-user32       = ctypes.windll.user32
-tray         = None
+# Thread-safe state flags
+_recording    = threading.Event()  # set while recording audio
+_transcribing = threading.Event()  # set while transcription thread is running
+
+# Audio buffer — written by the sounddevice callback, read by the transcription thread
+_audio_chunks: list = []
+_audio_lock = threading.Lock()
+
+model  = None
+user32 = ctypes.windll.user32
+tray   = None
 
 
 # ── Tray icon ─────────────────────────────────────────────────────────────────
 
 def _make_icon(color, dot_color=None):
-    """Draw a 64×64 circle icon. Optional small dot for recording indicator."""
     img  = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.ellipse([4, 4, 60, 60], fill=color)
@@ -159,11 +197,11 @@ def _make_icon(color, dot_color=None):
         draw.ellipse([20, 20, 44, 44], fill=dot_color)
     return img
 
-ICON_IDLE      = _make_icon((80, 80, 80))          # dark grey  = idle
-ICON_RECORDING = _make_icon((200, 30, 30), (255, 80, 80))  # red = recording
+ICON_IDLE      = _make_icon((80, 80, 80))
+ICON_RECORDING = _make_icon((200, 30, 30), (255, 80, 80))
 
 
-def set_tray_state(is_recording):
+def set_tray_state(is_recording: bool):
     if tray is None:
         return
     if is_recording:
@@ -176,116 +214,113 @@ def set_tray_state(is_recording):
 
 def build_tray():
     global tray
-    menu = pystray.Menu(
-        pystray.MenuItem("Quit", lambda icon, item: icon.stop())
-    )
+    menu = pystray.Menu(pystray.MenuItem("Quit", lambda icon, item: icon.stop()))
     tray = pystray.Icon("WhisperDictation", ICON_IDLE, "Whisper Dictation — Ready", menu)
-    tray.run()          # blocks; runs on its own thread
+    tray.run()          # blocks until icon.stop() is called
 
 
 # ── Audio & transcription ──────────────────────────────────────────────────────
 
 def audio_callback(indata, frames, time_info, status):
-    with _lock:
-        if recording:
-            audio_frames.append(indata.copy())
+    if _recording.is_set():
+        with _audio_lock:
+            _audio_chunks.append(indata.copy())
 
 
 def start_recording():
-    global recording, audio_frames
-    with _lock:
-        audio_frames = []
-        recording    = True
+    with _audio_lock:
+        _audio_chunks.clear()
+    _recording.set()
     set_tray_state(True)
     winsound.Beep(880, 120)   # high beep = started
-    print("Recording started (Ctrl+Alt+R to stop)", flush=True)
+    print("Recording started", flush=True)
+
+
+def _transcribe_audio(audio: np.ndarray, language=None):
+    """Run faster-whisper on a float32 numpy array. Returns (text, info)."""
+    segments, info = model.transcribe(
+        audio,
+        language=language,
+        initial_prompt=INITIAL_PROMPT,
+        beam_size=5,
+        vad_filter=True,
+    )
+    text = " ".join(seg.text for seg in segments).strip()
+    return text, info
 
 
 def stop_and_transcribe(target_hwnd):
-    global recording
-
-    with _lock:
-        recording = False
-        frames    = list(audio_frames)
-
-    set_tray_state(False)
-    winsound.Beep(440, 120)   # low beep = stopped
-
-    if not frames:
-        print("No audio captured.", flush=True)
-        return
-
-    print("Transcribing...", flush=True)
-    audio = np.concatenate(frames, axis=0).flatten().astype(np.float32)
-
-    tmp = None
+    _recording.clear()
+    _transcribing.set()
     try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            tmp = f.name
-        sf.write(tmp, audio, SAMPLE_RATE)
+        with _audio_lock:
+            chunks = list(_audio_chunks)
 
-        segments, info = model.transcribe(
-            tmp,
-            language=None,
-            initial_prompt=INITIAL_PROMPT,
-            beam_size=5,
-            vad_filter=True,
-        )
-        text = " ".join(seg.text for seg in segments).strip()
+        set_tray_state(False)
+        winsound.Beep(440, 120)   # low beep = stopped
 
-        # If Whisper picked a language other than EN or SK, re-transcribe
-        # forcing whichever of EN/SK had the higher probability.
+        if not chunks:
+            print("No audio captured.", flush=True)
+            return
+
+        print("Transcribing...", flush=True)
+        audio = np.concatenate(chunks, axis=0).flatten().astype(np.float32)
+
+        # Pass numpy array directly — no temp file needed
+        text, info = _transcribe_audio(audio)
+
+        # If Whisper picked a language outside EN/SK, re-transcribe with the
+        # better-scoring allowed language forced.
         if info.language not in ALLOWED_LANGS:
-            probs   = dict(info.all_language_probs or [])
-            forced  = "sk" if probs.get("sk", 0) >= probs.get("en", 0) else "en"
+            probs  = dict(info.all_language_probs or [])
+            forced = "sk" if probs.get("sk", 0) >= probs.get("en", 0) else "en"
             print(f"Detected '{info.language}', forcing '{forced}'", flush=True)
-            segments, info = model.transcribe(
-                tmp,
-                language=forced,
-                initial_prompt=INITIAL_PROMPT,
-                beam_size=5,
-                vad_filter=True,
-            )
-            text = " ".join(seg.text for seg in segments).strip()
+            text, info = _transcribe_audio(audio, language=forced)
 
+        if not text:
+            print("(nothing transcribed)", flush=True)
+            return
+
+        if text.lower() in HALLUCINATIONS:
+            print(f"(hallucination filtered: {text!r})", flush=True)
+            return
+
+        print(f"[{info.language}] {text}", flush=True)
+        pyperclip.copy(text)
+
+        # Wait for modifier keys to physically release (up to 2 s)
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if not (key_down(VK_CONTROL) or key_down(VK_ALT) or key_down(VK_R)):
+                break
+            time.sleep(0.05)
+        time.sleep(0.05)
+
+        # Restore focus to the window that was active when recording stopped
+        if target_hwnd:
+            user32.SetForegroundWindow(target_hwnd)
+            time.sleep(0.05)
+
+        _send_ctrl_v()
+
+    except Exception as e:
+        print(f"Transcription error: {e}", flush=True)
+        traceback.print_exc()
     finally:
-        if tmp and os.path.exists(tmp):
-            os.unlink(tmp)
-
-    if not text:
-        print("(nothing transcribed)", flush=True)
-        return
-
-    print(f"[{info.language}] {text}", flush=True)
-    pyperclip.copy(text)
-
-    # Wait for modifier keys to physically release
-    deadline = time.time() + 2.0
-    while time.time() < deadline:
-        if not (key_down(VK_CONTROL) or key_down(VK_ALT) or key_down(VK_R)):
-            break
-        time.sleep(0.05)
-    time.sleep(0.05)
-
-    # Restore focus to the window that was active when recording stopped
-    if target_hwnd:
-        user32.SetForegroundWindow(target_hwnd)
-        time.sleep(0.05)
-
-    _send_ctrl_v()
+        _transcribing.clear()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def key_down(vk):
+def key_down(vk: int) -> bool:
     return bool(user32.GetAsyncKeyState(vk) & 0x8000)
 
 
-def combo_pressed():
+def combo_pressed() -> bool:
     return key_down(VK_CONTROL) and key_down(VK_ALT) and key_down(VK_R)
 
 
-def _cuda_available():
+def _cuda_available() -> bool:
     for dll in ("cublas64_12.dll", "cublas64_11.dll"):
         try:
             ctypes.WinDLL(dll)
@@ -298,21 +333,22 @@ def _cuda_available():
 def _send_ctrl_v():
     KEYEVENTF_KEYUP = 0x0002
     VK_V            = 0x56
-    kbe = ctypes.windll.user32.keybd_event
-    kbe(VK_CONTROL, 0, 0,              0)
-    kbe(VK_V,       0, 0,              0)
+    kbe = user32.keybd_event
+    kbe(VK_CONTROL, 0, 0,               0)
+    kbe(VK_V,       0, 0,               0)
     kbe(VK_V,       0, KEYEVENTF_KEYUP, 0)
     kbe(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
 
 
 def on_hotkey():
-    global recording
-    if not recording:
-        start_recording()
-    else:
+    if _recording.is_set():
         # Capture focused window now — before transcription delay moves focus
         hwnd = user32.GetForegroundWindow()
         threading.Thread(target=stop_and_transcribe, args=(hwnd,), daemon=True).start()
+    elif _transcribing.is_set():
+        print("Still transcribing, ignoring.", flush=True)
+    else:
+        start_recording()
 
 
 def load_model():
@@ -343,7 +379,7 @@ def hotkey_loop():
             try:
                 on_hotkey()
             except Exception as e:
-                print(f"Error: {e}", flush=True)
+                print(f"Hotkey error: {e}", flush=True)
         was_down = down
         time.sleep(POLL_INTERVAL)
 
@@ -353,10 +389,13 @@ def hotkey_loop():
 def main():
     load_model()
 
+    # blocksize=2048 → ~8 callbacks/sec instead of ~60 with the default 256-sample block.
+    # Fewer GIL acquisitions from the audio thread = less jitter for Bluetooth HID devices.
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
         channels=CHANNELS,
         dtype="float32",
+        blocksize=2048,
         callback=audio_callback,
     )
     stream.start()
@@ -374,6 +413,8 @@ def main():
     finally:
         stream.stop()
         stream.close()
+        if tray is not None:
+            tray.stop()
         print("Bye.", flush=True)
 
 

@@ -135,6 +135,10 @@ C-library stderr noise.
 | 12 | `suppress=True` on `keyboard.add_hotkey` may need admin rights | Avoided by switching away from keyboard library for detection |
 | 13 | Multiple blank lines in console after "Ready" | ctranslate2 CUDA init noise; fix with `CT2_VERBOSE=0` + `2>nul` in bat |
 | 14 | nvidia-cudnn pip download corrupts on first try (hash mismatch) | Re-run with `--no-cache-dir` |
+| 15 | Frozen exe crashes at startup with "cublas64_12.dll missing" | In a PyInstaller exe, `site.getsitepackages()` returns the exe dir, not the real Python install — `_add_cuda_dll_dirs()` adds nothing → ctranslate2.dll can't load cuBLAS at import time. Fix: also scan `%LOCALAPPDATA%\Programs\Python\Python3*\Lib\site-packages` explicitly |
+| 16 | Hotkey pressed during transcription starts a new recording silently | Added `_transcribing` flag; `on_hotkey()` ignores start requests while transcription is running |
+| 17 | Exceptions in `stop_and_transcribe` daemon thread silently kill the thread | Wrapped entire function body in `try/except/finally`; errors now print to log and `_transcribing` is always cleared |
+| 18 | Continuously open mic stream causes Bluetooth mouse/audio lag | Keeping `sd.InputStream` open 24/7 can force BT devices into HFP/headset profile. Fix: open stream only on recording start, close immediately on stop (before transcription) |
 
 ---
 
