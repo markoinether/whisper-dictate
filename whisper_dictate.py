@@ -180,7 +180,11 @@ _transcribing = threading.Event()  # set while transcription thread is running
 
 # Audio buffer — written by the sounddevice callback, read by the transcription thread
 _audio_chunks: list = []
-_audio_lock = threading.Lock()
+_audio_lock  = threading.Lock()
+
+# Mic stream — opened only while recording; idle = no mic held open
+_stream      = None
+_stream_lock = threading.Lock()
 
 model  = None
 user32 = ctypes.windll.user32
@@ -222,17 +226,42 @@ def build_tray():
 # ── Audio & transcription ──────────────────────────────────────────────────────
 
 def audio_callback(indata, frames, time_info, status):
-    if _recording.is_set():
-        with _audio_lock:
-            _audio_chunks.append(indata.copy())
+    with _audio_lock:
+        _audio_chunks.append(indata.copy())
+
+
+def _open_stream():
+    global _stream
+    with _stream_lock:
+        if _stream is None:
+            s = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="float32",
+                blocksize=2048,
+                callback=audio_callback,
+            )
+            s.start()
+            _stream = s
+
+
+def _close_stream():
+    global _stream
+    with _stream_lock:
+        if _stream is not None:
+            _stream.stop()
+            _stream.close()
+            _stream = None
 
 
 def start_recording():
+    # Beep first — before opening the stream so audio routing changes don't swallow it
+    winsound.Beep(880, 120)
     with _audio_lock:
         _audio_chunks.clear()
+    _open_stream()
     _recording.set()
     set_tray_state(True)
-    winsound.Beep(880, 120)   # high beep = started
     print("Recording started", flush=True)
 
 
@@ -255,9 +284,11 @@ def stop_and_transcribe(target_hwnd):
     try:
         with _audio_lock:
             chunks = list(_audio_chunks)
+        # Beep before closing stream for same reason — routing change can swallow it
+        winsound.Beep(440, 120)
+        _close_stream()
 
         set_tray_state(False)
-        winsound.Beep(440, 120)   # low beep = stopped
 
         if not chunks:
             print("No audio captured.", flush=True)
@@ -389,16 +420,10 @@ def hotkey_loop():
 def main():
     load_model()
 
-    # blocksize=2048 → ~8 callbacks/sec instead of ~60 with the default 256-sample block.
-    # Fewer GIL acquisitions from the audio thread = less jitter for Bluetooth HID devices.
-    stream = sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=CHANNELS,
-        dtype="float32",
-        blocksize=2048,
-        callback=audio_callback,
-    )
-    stream.start()
+    # Warm up PortAudio so the first recording open is fast (~50ms vs ~400ms cold).
+    # Open and immediately close — this initialises drivers without holding the mic.
+    _open_stream()
+    _close_stream()
 
     threading.Thread(target=hotkey_loop, daemon=True).start()
     threading.Thread(target=build_tray,  daemon=True).start()
@@ -411,8 +436,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        stream.stop()
-        stream.close()
+        _close_stream()
         if tray is not None:
             tray.stop()
         print("Bye.", flush=True)
